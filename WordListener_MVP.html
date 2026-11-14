@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>WordListener · 实时识词朗读</title>
+<style>
+:root{color-scheme:dark;--bg:#101319;--panel:#1b222c;--line:#303b49;--accent:#79d6bd;--muted:#aab5c2}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#f3f6f8;font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:18px 16px 36px}
+main{max-width:680px;margin:auto}h1{font-size:25px;margin:8px 0 4px}p{color:var(--muted);line-height:1.5;margin:6px 0 14px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:14px;margin:12px 0}
+video{width:100%;max-height:42vh;object-fit:contain;background:#080a0d;border-radius:10px;transform:scaleX(-1)}
+button{border:0;border-radius:12px;padding:13px 16px;font-size:16px;font-weight:650;background:var(--accent);color:#092019}
+button.secondary{background:#303b49;color:#f3f6f8}button:disabled{opacity:.45}
+.row{display:flex;gap:9px;flex-wrap:wrap}.row button{flex:1;min-width:130px}
+#status{font-weight:650;color:var(--accent)}#word{font-size:36px;font-weight:750;letter-spacing:.4px;min-height:48px;overflow-wrap:anywhere}
+.small{font-size:13px;color:var(--muted)}label{display:block;margin:12px 0 5px;color:#d8e0e8;font-size:14px}
+input,select{width:100%;accent-color:var(--accent)}input[type=range]{height:28px}
+.stat{display:flex;justify-content:space-between;gap:12px;font-size:14px;color:var(--muted);padding:5px 0}
+.note{font-size:13px;color:#c2ccd6;background:#242e39;padding:10px;border-radius:10px}
+</style>
+</head>
+<body>
+<main>
+  <h1>WordListener</h1>
+  <p>iPhone 摄像头对准 iPad 上的天学网。检测到新单词后自动朗读，不需要截图。</p>
+
+  <section class="panel">
+    <video id="video" autoplay muted playsinline></video>
+    <div class="row" style="margin-top:12px">
+      <button id="start">开启摄像头</button>
+      <button id="run" class="secondary" disabled>开始自动识词</button>
+      <button id="stop" class="secondary" disabled>停止</button>
+    </div>
+    <div style="margin-top:12px" class="stat"><span>状态</span><span id="status">等待开启摄像头</span></div>
+  </section>
+
+  <section class="panel">
+    <div class="small">当前识别结果</div>
+    <div id="word">—</div>
+    <div class="stat"><span>识别次数</span><strong id="count">0</strong></div>
+    <div class="stat"><span>已朗读单词</span><strong id="spoken">0</strong></div>
+    <div class="stat"><span>识别间隔</span><strong id="intervalText">800 ms</strong></div>
+  </section>
+
+  <section class="panel">
+    <strong>识别设置</strong>
+    <label for="interval">检测间隔：<span id="intervalValue">800</span> ms</label>
+    <input id="interval" type="range" min="400" max="2000" step="100" value="800">
+    <label for="voice">英语语音</label>
+    <select id="voice"><option value="">系统默认英语语音</option></select>
+    <label for="rate">朗读速度：<span id="rateValue">0.85</span></label>
+    <input id="rate" type="range" min="0.65" max="1.15" step="0.05" value="0.85">
+    <label for="hold">新单词稳定确认次数：<span id="holdValue">2</span></label>
+    <input id="hold" type="range" min="1" max="4" step="1" value="2">
+    <p class="small">先用 800ms 测试稳定性。画面清晰、单词区域较大时，再尝试调快。</p>
+  </section>
+
+  <section class="panel">
+    <strong>使用提醒</strong>
+    <p class="note">请在 Safari 中通过 HTTPS 网页打开，并允许摄像头权限。不要在 iPad 的“文件”预览里打开。第一版使用摄像头观察 iPad 屏幕，不会读取或控制天学网 App 内部数据。</p>
+    <p class="small">原型限制：OCR 速度和识别准确率取决于摄像头距离、反光、字体大小及网络加载的识别引擎。请先用普通单词页面测试，确认效果后再用于作业。</p>
+  </section>
+</main>
+<canvas id="canvas" hidden></canvas>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+(() => {
+ const $=id=>document.getElementById(id);
+ const video=$('video'), canvas=$('canvas'), ctx=canvas.getContext('2d',{willReadFrequently:true});
+ let stream=null, worker=null, timer=null, busy=false, running=false;
+ let lastSpoken='', candidate='', candidateHits=0, ocrCount=0, spokenCount=0;
+ let voices=[];
+ const setStatus=s=>$('status').textContent=s;
+ function loadVoices(){
+   voices=speechSynthesis.getVoices();
+   const sel=$('voice'); const old=sel.value;
+   sel.innerHTML='<option value="">系统默认英语语音</option>';
+   voices.filter(v=>/^en(-|_)/i.test(v.lang)).forEach((v,i)=>{
+     const o=document.createElement('option');o.value=String(voices.indexOf(v));o.textContent=`${v.name} (${v.lang})`;sel.appendChild(o);
+   });
+   if(old)sel.value=old;
+ }
+ speechSynthesis.onvoiceschanged=loadVoices; loadVoices();
+ $('interval').addEventListener('input',e=>{$('intervalValue').textContent=e.target.value;$('intervalText').textContent=e.target.value+' ms';});
+ $('rate').addEventListener('input',e=>$('rateValue').textContent=Number(e.target.value).toFixed(2));
+ $('hold').addEventListener('input',e=>$('holdValue').textContent=e.target.value);
+
+ $('start').onclick=async()=>{
+   try{
+     stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}}});
+     video.srcObject=stream; await video.play();
+     $('run').disabled=false;$('stop').disabled=false;setStatus('摄像头已开启');
+   }catch(e){setStatus('摄像头开启失败：'+(e.message||e));}
+ };
+ $('run').onclick=async()=>{
+   if(!window.Tesseract){setStatus('识别引擎加载失败，请检查网络后刷新页面');return;}
+   if(!worker){
+     setStatus('正在加载英文识别引擎…');
+     try{
+       worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status==='recognizing text')setStatus('正在识别…');}});
+       await worker.setParameters({tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-\'',preserve_interword_spaces:'1',tessedit_pageseg_mode:'7'});
+     }catch(e){setStatus('识别引擎初始化失败：'+(e.message||e));worker=null;return;}
+   }
+   if(running)return;
+   running=true;lastSpoken='';candidate='';candidateHits=0;
+   $('run').disabled=true;setStatus('自动识词中');
+   loop();
+ };
+ async function loop(){
+   if(!running||busy)return;
+   if(video.readyState<2){timer=setTimeout(loop,300);return;}
+   busy=true;
+   try{
+     // 先取画面中央区域；后续可根据天学网实际版式调整裁剪范围。
+     const vw=video.videoWidth,vh=video.videoHeight;
+     const sx=Math.round(vw*.12), sy=Math.round(vh*.18);
+     const sw=Math.round(vw*.76), sh=Math.round(vh*.64);
+     const scale=Math.min(1,1000/sw);
+     canvas.width=Math.round(sw*scale);canvas.height=Math.round(sh*scale);
+     ctx.drawImage(video,sx,sy,sw,sh,0,0,canvas.width,canvas.height);
+     const {data}=await worker.recognize(canvas);
+     ocrCount++;$('count').textContent=ocrCount;
+     const words=(data.text||'').match(/[A-Za-z][A-Za-z'-]{1,}/g)||[];
+     const cleaned=words.map(w=>w.replace(/^[-']+|[-']+$/g,'')).filter(w=>w.length>=2);
+     // 当前版本取 OCR 结果中的首个有效词；正式适配时需按实际单词显示区域精确裁剪。
+     const found=cleaned[0]||'';
+     if(found){
+       $('word').textContent=found;
+       const normalized=found.toLowerCase();
+       if(normalized===candidate.toLowerCase())candidateHits++;
+       else{candidate=found;candidateHits=1;}
+       if(candidateHits>=Number($('hold').value)&&normalized!==lastSpoken.toLowerCase()){
+         lastSpoken=found;spokenCount++;$('spoken').textContent=spokenCount;
+         const utter=new SpeechSynthesisUtterance(found);
+         utter.lang='en-US';utter.rate=Number($('rate').value);
+         const vi=$('voice').value;if(vi!==''){const v=voices[Number(vi)];if(v)utter.voice=v;}
+         speechSynthesis.cancel();speechSynthesis.speak(utter);
+         setStatus('已朗读：'+found);
+       }else if(normalized===lastSpoken.toLowerCase()){
+         setStatus('等待下一题…');
+       }else setStatus('确认新单词…');
+     }else setStatus('暂未识别到单词…');
+   }catch(e){setStatus('识别出错：'+(e.message||e));}
+   finally{
+     busy=false;
+     if(running)timer=setTimeout(loop,Number($('interval').value));
+   }
+ }
+ $('stop').onclick=()=>{
+   running=false;clearTimeout(timer);speechSynthesis.cancel();
+   $('run').disabled=!stream;setStatus('已停止');
+ };
+ window.addEventListener('pagehide',()=>{running=false;clearTimeout(timer);if(stream)stream.getTracks().forEach(t=>t.stop());});
+})();
+</script>
+</body>
+</html>
